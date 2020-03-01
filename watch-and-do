@@ -1,0 +1,102 @@
+#!/bin/bash
+#
+# The first argument is the folder to listen. The second argument is the command to execute.
+
+# validate amount of arguments
+if [ $# -lt 2 ]; then
+    echo "Usage: watch-and-do WATCHDIR COMMAND"
+    echo "Wait for changes on files of WATCHDIR and executes COMMAND when a change is detected."
+    exit 1
+fi
+
+# validate the directory to watch
+WATCHDIR=$1
+if [ ! -d $WATCHDIR ]; then
+    echo "Error: invalid directory $WATCHDIR"
+    exit 1
+fi
+
+# general variables
+CHANGES_DETECTION_SLEEP="3s"
+TESTS_KILLING_SLEEP="1s"
+
+# create filenames
+STOCK_UUID=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 10 | head -n 1)
+STOCK_FILE="/dev/shm/$STOCK_UUID"
+PID_UUID=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 10 | head -n 1)
+PID_FILE="/dev/shm/$PID_UUID"
+
+# init files
+echo 0 > $STOCK_FILE
+echo 0 > $PID_FILE
+
+# This function stop current execution of the command and then run the command again.
+function run_command {
+    # flag to indicate if the command is under kill
+    KILLING=0
+    
+    # check if the command is running
+    LASTPID=$(cat $PID_FILE)
+    echo "PID of last command: $LASTPID"
+    while [ $LASTPID ] && [ $LASTPID -gt 0 ] && (ps -p $LASTPID > /dev/null)
+    do
+    	# kill previous command
+    	if [ $KILLING -eq 0 ]
+    	then
+    	    KILLING=1
+    	    kill -SIGTERM $LASTPID
+    	fi
+    	
+    	# wait until previous command is finished
+    	echo "Wait while current command is stopped..."
+    	sleep $TESTS_KILLING_SLEEP
+    done
+    
+    # If previous command was killed
+    if [ $KILLING -eq 1 ]
+    then
+        echo "Previous command has been cancelled."
+    fi
+    
+    # execute command
+    echo "Running command: $@"
+    $@ &
+    
+    # store the pid of the thread running the command
+    echo $! > $PID_FILE
+}
+
+# This function handles changes on files and executes the command. It run the command once for multiple changes done in a short period.
+function process_change_event {
+    # increase the stock
+    echo $(( $(cat $STOCK_FILE) + 1 )) > $STOCK_FILE
+    #echo "Stock[$STOCK_FILE]+: $(cat $STOCK_FILE)"
+    
+    # sleep for a moment while more changes are detected
+    sleep $CHANGES_DETECTION_SLEEP
+    
+    # decrease stock
+    echo $(( $(cat $STOCK_FILE) - 1 )) > $STOCK_FILE
+    #echo "Stock[$STOCK_FILE]-: $(cat $STOCK_FILE)"
+    
+    # if stock is empty (this discard multiple execution)
+    if [ $(cat $STOCK_FILE) -eq 0 ]
+    then
+    	# run command
+    	run_command $@
+    fi
+}
+
+# listen for changes
+echo "Waiting for the first change..."
+inotifywait -m -r -q -e modify -e create -e delete -e move --format "%w%f %e" $WATCHDIR \
+| while read FILE EVENTS; do
+    # clear
+    echo "change ($EVENTS) detected in $FILE"
+    process_change_event ${@:2} &
+    
+    # sleep to make the stock effective
+    sleep 0.25s
+done
+
+exit 0
